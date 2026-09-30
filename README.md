@@ -30,10 +30,10 @@ User text
 
 | Folder | Owner | Responsibility |
 |---|---|---|
-| [`ai-engine/`](./ai-engine) | Person 1 | Mert | Claim extraction, claim decomposition, prompt design, verdict generation, explanations |
-| [`search-retrieval/`](./search-retrieval) | Arda | Person 2 | Web search/scraping, chunking, embeddings, BM25/vector search, reranking, source selection |
-| [`backend/`](./backend) | Person 3 | Fatih | API endpoints, wiring the modules together, database/cache, error handling, deployment |
-| [`frontend/`](./frontend) | Person 4 | Osman | Web UI, results screen, source display, later a mobile app |
+| [`ai-engine/`](./ai-engine) | Person 1 (Mert) | Claim extraction, claim decomposition, prompt design, verdict generation, explanations |
+| [`search-retrieval/`](./search-retrieval) | Person 2 (Arda)  | Web search/scraping, chunking, embeddings, BM25/vector search, reranking, source selection |
+| [`backend/`](./backend) | Person 3 (Fatih) | API endpoints, wiring the modules together, database/cache, error handling, deployment |
+| [`frontend/`](./frontend) | Person 4 (Osman) | Web UI, results screen, source display, later a mobile app |
 
 Each folder is that person's workspace: its own README, its own
 dependencies, and its own tests. `backend/` is what ties everyone's
