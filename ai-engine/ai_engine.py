@@ -22,12 +22,16 @@ This module exposes exactly two functions Person 3 (Backend) needs:
 Everything else (prompt text, model choice, temperature, JSON schema
 enforcement) is an internal detail Backend should not have to touch.
 
+Provider: Groq (https://groq.com) — OpenAI-compatible Chat Completions
+API with "strict" JSON-schema structured output, called via the
+official `groq` Python package. (Previously this module used Gemini;
+the team switched to Groq.)
+
 Setup
 -----
     pip install -r requirements.txt
-    export GEMINI_API_KEY="..."          # see .env.example
-
-    python ai_engine.py                  # runs the smoke tests below
+    cp .env.example .env         # then put your real key in .env
+    python ai_engine.py          # runs the smoke tests below
 """
 
 from __future__ import annotations
@@ -36,22 +40,29 @@ import json
 import os
 from typing import List, Optional
 
-import google.generativeai as genai
-from pydantic import BaseModel, Field
+from dotenv import load_dotenv
+from groq import Groq
+from pydantic import BaseModel, ConfigDict, Field
+
+# Pick up GROQ_API_KEY (and any other overrides) from a local .env
+# file if one exists. No-op if there isn't one / the vars are already
+# set in the environment.
+load_dotenv()
 
 
 # ============================================================
 # 1. CONFIG
 # ============================================================
 
-# Cost-effective, low-latency model chosen for this project (validated
-# in the Google AI Studio playground before this module was written).
-# Kept as a constant/env override so it's a one-line change if a newer
-# model should be swapped in later.
-DEFAULT_MODEL_NAME = os.environ.get("FACTCHECK_MODEL_NAME", "gemini-3.8-flash")
+# Both of these support Groq's "strict" structured-output mode (the
+# response is *guaranteed* to match our JSON schema). gpt-oss-20b is
+# the faster/cheaper of the two — good for iterating during
+# development; swap to openai/gpt-oss-120b for higher quality later
+# if needed, via the FACTCHECK_MODEL_NAME env var.
+DEFAULT_MODEL_NAME = os.environ.get("FACTCHECK_MODEL_NAME", "openai/gpt-oss-20b")
 
 # temperature=0.0: this system must behave like a rule-following
-# classifier, not a creative writer. Halucination-suppression, not
+# classifier, not a creative writer. Hallucination-suppression, not
 # style, is the goal.
 DEFAULT_TEMPERATURE = 0.0
 
@@ -59,9 +70,18 @@ DEFAULT_TEMPERATURE = 0.0
 # ============================================================
 # 2. PYDANTIC SCHEMAS (the data contract with Backend / Person 3)
 # ============================================================
+#
+# NOTE: these also double as the JSON schemas sent to Groq's "strict"
+# structured-output mode, which requires every field to be required
+# (no defaults) and every object to forbid extra properties. That's
+# why `model_config = ConfigDict(extra="forbid")` is set on each one,
+# and why `used_sources` below has no default — don't remove either
+# without re-reading https://console.groq.com/docs/structured-outputs.
 
 class Claim(BaseModel):
     """A single atomic, independently verifiable claim."""
+
+    model_config = ConfigDict(extra="forbid")
 
     id: str
     text: str
@@ -74,11 +94,18 @@ class Claim(BaseModel):
 
 
 class ExtractionResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     claims: List[Claim]
 
 
 class Source(BaseModel):
-    """One labelled evidence snippet handed to us by Person 2 (Search)."""
+    """One labelled evidence snippet handed to us by Person 2 (Search).
+
+    This is only ever an INPUT we build ourselves (never something the
+    model has to return), so it doesn't need the strict-schema config
+    above.
+    """
 
     id: str  # e.g. "kaynak_1" / "source_1" — must match what appears in prompts
     url: Optional[str] = None
@@ -86,14 +113,16 @@ class Source(BaseModel):
 
 
 class VerdictResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     claim_id: str
     verdict: str = Field(
         description="One of: SUPPORTED, REFUTED, NOT ENOUGH EVIDENCE, CONFLICTING"
     )
     explanation: str
     used_sources: List[str] = Field(
-        default_factory=list,
-        description="IDs of only the sources actually relied on in `explanation`.",
+        description="IDs of only the sources actually relied on in `explanation`. "
+        "Use an empty list if none were used."
     )
 
 
@@ -119,6 +148,7 @@ Kurallar:
 - Gelecek tahminlerini, öznel yargıları ve ölçülemez/muğlak ifadeleri
   is_verifiable=false olarak işaretle (yine de listeye ekleyebilirsin).
 - Sadece verilen JSON şemasında çıktı ver, başka hiçbir açıklama ekleme.
+- Eğer hiçbir doğrulanabilir iddia yoksa, boş bir claims listesi döndür.
 """
 
 VERDICT_SYSTEM_PROMPT = """\
@@ -139,8 +169,8 @@ Kurallar:
   sonuna [kaynak_id] şeklinde köşeli parantez içinde atıf yap.
 - Konuyla alakasız kanıtları (tuzak kanıtları) tamamen yoksay ve
   'used_sources' listesine ekleme.
-- 'used_sources' listesine SADECE açıklama içinde gerçekten atıf yaptığın
-  kaynakların ID'lerini ekle.
+- 'used_sources' alanına SADECE açıklama içinde gerçekten atıf yaptığın
+  kaynakların ID'lerini ekle; hiçbiri kullanılmadıysa boş liste ([]) döndür.
 - Sadece verilen JSON şemasında çıktı ver, başka hiçbir açıklama ekleme.
 """
 
@@ -149,8 +179,20 @@ Kurallar:
 # 4. ENGINE
 # ============================================================
 
+def _strict_response_format(model: type[BaseModel], name: str) -> dict:
+    """Build the {"type": "json_schema", ...} block Groq's strict mode expects."""
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": name,
+            "strict": True,
+            "schema": model.model_json_schema(),
+        },
+    }
+
+
 class FactCheckEngine:
-    """Thin, stateless wrapper around the two Gemini calls this module owns."""
+    """Thin, stateless wrapper around the two Groq calls this module owns."""
 
     def __init__(
         self,
@@ -158,47 +200,52 @@ class FactCheckEngine:
         model_name: str = DEFAULT_MODEL_NAME,
         temperature: float = DEFAULT_TEMPERATURE,
     ):
-        api_key = api_key or os.environ.get("GEMINI_API_KEY")
+        api_key = api_key or os.environ.get("GROQ_API_KEY")
         if not api_key:
             raise RuntimeError(
-                "No Gemini API key found. Set GEMINI_API_KEY in your "
-                "environment (see .env.example) or pass api_key=... explicitly."
+                "No Groq API key found. Create a .env file (see "
+                ".env.example) with GROQ_API_KEY=..., or pass "
+                "api_key=... explicitly. Get a key at "
+                "https://console.groq.com/keys"
             )
-        genai.configure(api_key=api_key)
+        self.client = Groq(api_key=api_key)
         self.model_name = model_name
         self.temperature = temperature
 
     # -- internal helper --------------------------------------------------
 
-    def _model(self, system_instruction: str, response_schema) -> genai.GenerativeModel:
-        return genai.GenerativeModel(
-            model_name=self.model_name,
-            system_instruction=system_instruction,
-            generation_config={
-                "temperature": self.temperature,
-                "response_mime_type": "application/json",
-                "response_schema": response_schema,
-            },
+    def _generate(self, system_prompt: str, user_prompt: str, schema_model, schema_name: str):
+        completion = self.client.chat.completions.create(
+            model=self.model_name,
+            temperature=self.temperature,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            response_format=_strict_response_format(schema_model, schema_name),
         )
+        content = completion.choices[0].message.content
+        return schema_model.model_validate(json.loads(content))
 
     # -- public API (this is the contract Backend/Person 3 calls) --------
 
     def extract_claims(self, text: str) -> ExtractionResult:
         """Split raw user text into atomic, verifiable claims."""
-        model = self._model(EXTRACTION_SYSTEM_PROMPT, ExtractionResult)
-        response = model.generate_content(f"Metin: {text}")
-        data = json.loads(response.text)
-        return ExtractionResult.model_validate(data)
+        return self._generate(
+            EXTRACTION_SYSTEM_PROMPT,
+            f"Metin: {text}",
+            ExtractionResult,
+            "extraction_result",
+        )
 
     def verify_claim(self, claim_text: str, sources: List[Source]) -> VerdictResult:
         """Judge a single claim against labelled evidence snippets."""
         evidence_block = "\n".join(f"[{s.id}]: {s.text}" for s in sources)
         prompt = f"İddia: {claim_text}\n\nKanıtlar:\n{evidence_block}"
 
-        model = self._model(VERDICT_SYSTEM_PROMPT, VerdictResult)
-        response = model.generate_content(prompt)
-        data = json.loads(response.text)
-        result = VerdictResult.model_validate(data)
+        result = self._generate(
+            VERDICT_SYSTEM_PROMPT, prompt, VerdictResult, "verdict_result"
+        )
 
         if result.verdict not in VALID_VERDICTS:
             raise ValueError(
